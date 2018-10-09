@@ -1,0 +1,25 @@
+[
+  {
+    "name": "app",
+    "image": "aws_account.dkr.ecr.us-east-1.amazonaws.com/ENVIRONMENT-APP_NAME:1",
+    "readonlyRootFilesystem": false,
+    "environment": [
+      {
+        "name": "RAILS_ENV",
+        "value":"ENVIRONMENT"
+      },
+      {
+        "name": "PORT",
+        "value":"CONTAINER_PORT"
+      }
+     ],
+    "essential": true,
+    "portMappings": [
+      {
+        "protocol": "tcp",
+        "containerPort": CONTAINER_PORT,
+        "hostPort": CONTAINER_PORT
+      }
+    ]
+  }
+]

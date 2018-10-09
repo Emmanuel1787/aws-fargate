@@ -1,0 +1,7 @@
+[
+  {
+    "targetGroupArn": "TARGET_GROUP_ARN",
+    "containerName": "CONTAINER_NAME",
+    "containerPort": CONTAINER_PORT
+  }
+]

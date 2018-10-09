@@ -1,0 +1,382 @@
+#!/usr/bin/env bash
+
+# NOTES:
+# - Use "./" command to run this script
+# - it you create a new file update the permissions: sudo chmod a+x .circleci/deploy.sh
+
+JQ="jq --raw-output --exit-status"
+
+ENVIRONMENT=$1
+VERSION=$2
+
+. "./.pf_deploy.$ENVIRONMENT"
+
+SERVICE_NAME="pf-$ENVIRONMENT-$APP_NAME-service"
+CLUSTER_NAME="pf-$ENVIRONMENT-scrappers-ec2"
+TASK_FAMILY="pf-$ENVIRONMENT-$APP_NAME-task-family"
+APP_REPO=$ENVIRONMENT-$APP_NAME
+DESIRED_COUNT=1
+#
+# Validates environment variables
+#
+
+validate_environment_variables(){
+  if [[ -z $APP_NAME ]]
+  then
+    print_message "You must set the APP_NAME variable"
+    exit 1
+  fi
+  if [[ -z $CLUSTER_NAME ]]
+  then
+    print_message "You must set the CLUSTER_NAME variable"
+    exit 1
+  fi
+  if [[ -z $ENVIRONMENT ]]
+  then
+    print_message "You must set the ENVIRONMENT variable"
+    exit 1
+  fi
+  if [[ -z $VERSION ]]
+  then
+    print_message "You must set the VERSION variable"
+    exit 1
+  fi
+  if [[ -z $CPU ]]
+  then
+    print_message "You must set the CPU variable"
+    exit 1
+  fi
+  if [[ -z $MEMORY ]]
+  then
+    print_message "You must set the MEMORY variable"
+    exit 1
+  fi
+  if [[ -z $ROL_ARN ]]
+  then
+    print_message "You must set the ROL_ARN variable"
+    exit 1
+  fi
+  if [[ -z $SUBNET1 ]]
+  then
+    print_message "You must set the SUBNET1 variable"
+    exit 1
+  fi
+  if [[ -z $SUBNET2 ]]
+  then
+    print_message "You must set the SUBNET2 variable"
+    exit 1
+  fi
+  if [[ -z $SUBNET3 ]]
+  then
+    print_message "You must set the SUBNET3 variable"
+    exit 1
+  fi
+  if [[ -z $SUBNET4 ]]
+  then
+    print_message "You must set the SUBNET4 variable"
+    exit 1
+  fi
+  if [[ -z $SECURITY_GROUP ]]
+  then
+    print_message "You must set the SECURITY_GROUP variable"
+    exit 1
+  fi
+  if [[ -z $TARGET_GROUP_ARN ]]
+  then
+    print_message "You must set the TARGET_GROUP_ARN variable"
+    exit 1
+  fi
+  if [[ -z $CONTAINER_NAME ]]
+  then
+    print_message "You must set the CONTAINER_NAME variable"
+    exit 1
+  fi
+  if [[ -z $CONTAINER_PORT ]]
+  then
+    print_message "You must set the CONTAINER_PORT variable"
+    exit 1
+  fi
+  if [[ -z $PORT ]]
+  then
+    print_message "You must set the PORT variable"
+    exit 1
+  fi
+}
+
+#
+# Setup AWS cli with the right credentials based on the deployed environment
+#
+
+setup_env_amazon() {
+  if [[  $ENVIRONMENT =~ qa  ]] ; then
+    export AWS_ACCOUNT_ID=$QA_AWS_ACCOUNT_ID
+    export AWS_ACCESS_KEY_ID=$QA_AWS_ACCESS_KEY_ID
+    export AWS_SECRET_ACCESS_KEY=$QA_AWS_SECRET_ACCESS_KEY
+  fi
+  if [[  $ENVIRONMENT =~ staging  ]] ; then
+    export AWS_ACCOUNT_ID=$STAGING_AWS_ACCOUNT_ID
+    export AWS_ACCESS_KEY_ID=$STAGING_AWS_ACCESS_KEY_ID
+    export AWS_SECRET_ACCESS_KEY=$STAGING_AWS_SECRET_ACCESS_KEY
+  fi
+  if [[  $ENVIRONMENT =~ production  ]] ; then
+    export AWS_ACCOUNT_ID=$PRODUCTION_AWS_ACCOUNT_ID
+    export AWS_ACCESS_KEY_ID=$PRODUCTION_AWS_ACCESS_KEY_ID
+    export AWS_SECRET_ACCESS_KEY=$PRODUCTION_AWS_SECRET_ACCESS_KEY
+  fi
+  if [[ -z $AWS_ACCOUNT_ID ]]
+  then
+    print_message "You must set the AWS_ACCOUNT_ID variable"
+    exit 1
+  fi
+  if [[ -z $AWS_ACCESS_KEY_ID ]]
+  then
+    print_message "You must set the AWS_ACCESS_KEY_ID variable"
+    exit 1
+  fi
+  if [[ -z $AWS_SECRET_ACCESS_KEY ]]
+  then
+    print_message "You must set the AWS_SECRET_ACCESS_KEY variable"
+    exit 1
+  fi
+}
+
+#
+# Sets AWS cli config
+#
+
+configure_aws_cli() {
+  aws --version
+  aws configure set default.region us-east-1
+  aws configure set default.output json
+}
+
+#
+# Creates the contanier definition based on the previous ones already in AWS
+#
+
+create_container_definitions() {
+  CONTAINER_DEFINITIONS=()
+
+  #
+  # Gets the current task definition
+  #
+
+  TASK_DEFINITION=$(aws ecs describe-task-definition --task-definition ${TASK_FAMILY})
+  print_message "Task definition" "$TASK_DEFINITION"
+
+  #
+  # Creates a task definition if it does not exist yet
+  #
+
+  if [[ -z $TASK_DEFINITION ]]
+  then
+    INITIAL_CONTAINER_DEFINITIONS_JSON=$(cat .circleci/initial-container-definitions.json | \
+      sed "s/ENVIRONMENT/$ENVIRONMENT/g" | \
+      sed "s/APP_NAME/$APP_NAME/g" | \
+      sed "s/CONTAINER_PORT/$CONTAINER_PORT/g")
+    print_message "Initial containers definitions:" "$INITIAL_CONTAINER_DEFINITIONS_JSON"
+
+    TASK_DEFINITION=$(aws ecs register-task-definition --family ${TASK_FAMILY} --network-mode awsvpc --requires-compatibilities FARGATE --cpu ${CPU} --memory ${MEMORY} --container-definitions "$INITIAL_CONTAINER_DEFINITIONS_JSON"  --execution-role-arn ${ROL_ARN})
+    print_message "New Task definition" "$TASK_DEFINITION"
+
+    if [[ -z $TASK_DEFINITION  ]]
+    then
+      print_message "ERROR creating task definition" "$TASK_DEFINITION"
+      exit 1
+    fi
+  fi
+
+  #
+  # Gets the current number of task definition containers
+  #
+
+  NUMBER_OF_CONTAINER_TEMPLATES=$(echo "$TASK_DEFINITION" | $JQ '.taskDefinition.containerDefinitions | [.[].name] | length')
+  print_message "Number of used containers: $NUMBER_OF_CONTAINER_TEMPLATES"
+
+  #
+  # Iterates over the current containers in order to put the previous variables into the new containers.
+  # TODO: compare if the task definition did not change with the current deploy in order to do not do a new revision unnecessarily
+  #
+
+  for ((i=0;i<=`expr $NUMBER_OF_CONTAINER_TEMPLATES - 1`;i++)); do
+    CONTAINER_TEMPLATE=$( echo "$TASK_DEFINITION" | $JQ ".taskDefinition.containerDefinitions[$i]")
+    print_message "Previous template $i" "$CONTAINER_TEMPLATE"
+
+    NEW_CONTAINER_DEFINITION=$(echo "$CONTAINER_TEMPLATE" | jq ".image = \"$AWS_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/${ENVIRONMENT}-${APP_NAME}:$VERSION\""  )
+    print_message "New template $i" "$NEW_CONTAINER_DEFINITION"
+
+    CONTAINER_DEFINITIONS+=$(echo "$NEW_CONTAINER_DEFINITION")
+  done
+
+  CONTAINER_DEFINITIONS_JSON=$(echo "$CONTAINER_DEFINITIONS" | $JQ -s '.')
+  print_message "New container definitions. Number: ${#CONTAINER_DEFINITIONS[@]}" "$CONTAINER_DEFINITIONS_JSON"
+}
+
+#
+# Registers a task definition taking into account the new container definition.
+#
+
+register_task_definition() {
+  if revision_arn=$(aws ecs register-task-definition --family ${TASK_FAMILY} --network-mode awsvpc --requires-compatibilities FARGATE --cpu ${CPU} --memory ${MEMORY} --execution-role-arn ${ROL_ARN}  --container-definitions "$CONTAINER_DEFINITIONS_JSON" --family $TASK_FAMILY | \
+    $JQ '.taskDefinition.taskDefinitionArn')
+
+  then
+    print_message "Revision: $revision_arn"
+  else
+    print_message "Failed to register task definition"
+    exit 1
+  fi
+}
+
+#
+# Tags and Pushs the project image to ECR
+#
+
+push_ecr_image(){
+  eval $(aws ecr get-login --region us-east-1 --no-include-email --registry-ids $AWS_ACCOUNT_ID)
+  docker-compose -f docker-compose.build.$ENVIRONMENT.yml build
+  echo "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAaa"
+  echo "---------------------------------------MIGRATIONS-----------------------------------------"
+  echo $ENVIRONMENT
+  echo "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAaa"
+  docker-compose -f docker-compose.build.$ENVIRONMENT.yml run app cat config/database.yml
+  echo "bBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+  docker-compose -f docker-compose.build.$ENVIRONMENT.yml run app bundle exec rails db:migrate
+  echo "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAaa"
+  echo "---------------------------------ENDING MIGRATIONS-----------------------------------------"
+  echo "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAaa"
+  docker tag $APP_REPO $AWS_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/$APP_REPO:$VERSION
+  docker push $AWS_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/$APP_REPO:$VERSION
+}
+
+#
+# Raises up the service based on the built image and task definition
+#
+
+deploy_cluster() {
+  print_message "Cluster: ${CLUSTER_NAME}"
+
+  #
+  # Gets the services status, and if exist, the failure reasons
+  #
+
+  service_status=$(aws ecs describe-services --cluster ${CLUSTER_NAME} --services ${SERVICE_NAME} | $JQ '.services[0].status')
+  print_message "Service status: ${service_status}"
+
+  failure_reasons=$(aws ecs describe-services --cluster ${CLUSTER_NAME} --services ${SERVICE_NAME} | $JQ '.failures | .[] | .reason')
+  print_message "Failure reasons: ${failure_reasons}"
+
+  #
+  # Setup load balancer parameters and network configuration
+  #
+  LOAD_BALANCER_PARAMETERS_JSON=$(cat .circleci/load-balancer-parameters.json | \
+    sed "s,TARGET_GROUP_ARN,$TARGET_GROUP_ARN,g" | \
+    sed "s/CONTAINER_NAME/$CONTAINER_NAME/g" | \
+    sed "s/CONTAINER_PORT/$CONTAINER_PORT/g")
+  print_message "Load balancer parameters:${LOAD_BALANCER_PARAMETERS_JSON}"
+
+  NETWORK_CONFIGURATIONS_JSON=$(cat .circleci/network-configurations.json | \
+    sed "s/SUBNET1/$SUBNET1/g" | \
+    sed "s/SUBNET2/$SUBNET2/g" | \
+    sed "s/SUBNET3/$SUBNET3/g" | \
+    sed "s/SUBNET4/$SUBNET4/g" | \
+    sed "s/SECURITY_GROUP/$SECURITY_GROUP/g")
+  print_message "Network configurations: $NETWORK_CONFIGURATIONS_JSON"
+
+  #
+  # Creates or re activate the app service
+  #
+
+  if [[ $failure_reasons == MISSING ]]
+  then
+     $SERVICE=$(aws ecs create-service --service-name "$SERVICE_NAME" \
+       --task-definition "$revision_arn" \
+       --cluster "$CLUSTER_NAME" \
+       --desired-count "$DESIRED_COUNT" \
+       --network-configuration "$NETWORK_CONFIGURATIONS_JSON" \
+       --launch-type "FARGATE" \
+       --load-balancers "$LOAD_BALANCER_PARAMETERS_JSON")
+  fi
+  if [[ $service_status == INACTIVE  ]]
+  then
+    delete_service=$( aws ecs delete-service --service "$SERVICE_NAME" --cluster "$CLUSTER_NAME" )
+    print_message  "Delete service:" "$delete_service"
+
+    $SERVICE=$(aws ecs create-service --service-name "$SERVICE_NAME" --task-definition "$revision_arn" --cluster "$CLUSTER_NAME" --desired-count "$DESIRED_COUNT" --network-configuration "$NETWORK_CONFIGURATIONS_JSON" --launch-type "FARGATE" --load-balancers "$LOAD_BALANCER_PARAMETERS_JSON")
+  fi
+  if [[ ( -z $SERVICE && "$service_status" != "ACTIVE") ]]
+  then
+    print_message "ERROR Creating service" "$SERVICE"
+    exit 1
+  else
+    print_message "Service Created/Updated" "$SERVICE"
+  fi
+
+  #
+  # Get the current service configuration on number of desired running tasks
+  #
+
+  if [[ $service_status == ACTIVE ]]
+  then
+    DESIRED_COUNT=$(aws ecs describe-services --cluster ${CLUSTER_NAME} --services ${SERVICE_NAME} | $JQ '.services[0].desiredCount')
+  fi
+
+  if [ ${DESIRED_COUNT} = "0" ]
+  then
+    DESIRED_COUNT="1"
+  fi
+  print_message "DESIRED_COUNT:" "$DESIRED_COUNT"
+
+  #
+  # Stops previous task and update service in order to run them again with the last changes.
+  #
+
+  tasks=$(aws --region us-east-1 ecs list-tasks --cluster ${CLUSTER_NAME} --family ${TASK_FAMILY} | \
+    $JQ '.taskArns | map(.[40:]) | reduce .[] as $item (""; . + $item + " ")')
+
+  if [[ -z $tasks ]]
+  then
+    print_message "There are not any task running"
+  else
+    for task in $tasks; do
+      aws --region us-east-1 ecs stop-task --task $task --cluster ${CLUSTER_NAME}
+      print_message "Service stoped" "$task"
+    done
+  fi
+
+  UPDATED_SERVICE=$(aws ecs update-service --service ${SERVICE_NAME} --task-definition ${revision_arn} --cluster ${CLUSTER_NAME} --desired-count ${DESIRED_COUNT} --network-configuration "$NETWORK_CONFIGURATIONS_JSON")
+
+  if [[ $(echo $UPDATED_SERVICE | $JQ '.service.taskDefinition') != $revision_arn ]]
+  then
+    print_message "Error updating service." "$UPDATED_SERVICE"
+    exit 1
+  else
+    print_message "Updated service" "$UPDATED_SERVICE"
+  fi
+}
+
+#
+# Helper to print messages if the DESC environment variable is set it will print the second parameter
+# @params $1 -> message
+# @params $2 -> variables
+#
+
+print_message(){
+  echo "[INFO]: $1"
+  if [[ $TRACE =~ yes ]]
+  then
+    echo "[DESC]: $2"
+  fi
+}
+
+#
+# RUN YOU M**** F***R
+#
+
+validate_environment_variables
+setup_env_amazon
+configure_aws_cli
+create_container_definitions
+register_task_definition
+push_ecr_image
+deploy_cluster

@@ -1,0 +1,118 @@
+machine:
+  ruby:
+version: 2
+jobs:
+  build:
+    docker:
+      - image: ruby:2.4.1
+        environment:
+          RAILS_ENV: test
+          RACK_ENV: test
+          BUNDLE_PATH: vendor/bundle
+          PGUSER: ubuntu
+          PGHOST: 127.0.0.1
+          POSTGRES_DB: pf_test_db
+          #NEO4J_URL: http://neo4j:neodb4j@localhost:7474
+          #NEO4J_HOST: http://localhost:7474
+          #NEO4J_USER: neo4j
+          #NEO4J_DEFAULT_PASS: neo4j
+          #NEO4J_PASS: neodb4j
+      - image: postgres:9.6
+        environment:
+          POSTGRES_USER: ubuntu
+          POSTGRES_DB: pf_test_db
+      #- image: neo4j:3.0
+    steps:
+      - checkout
+      - run:
+          name: Dependencies Node-ImageMagic
+          command: apt-get update -qq && apt-get install -y build-essential libpq-dev nodejs imagemagick xmlsec1
+      - run:
+          name: Install AWS dependencies
+          command: apt-get install -y libssl-dev libffi-dev python-dev jq python python-pip && pip install awscli --upgrade --user
+      - run:
+          name: Copy Files
+          command: cd config/ && cp database.yml.example database.yml && cp application.yml.example application.yml && cp hutch.yml.example hutch.yml
+      - restore_cache:
+          keys:
+            - portal-finance-api-{{ checksum "Gemfile.lock" }}
+            - portal-finance-api-
+      - run:
+          name: Bundle Install
+          command: bundle check --path vendor/bundle || bundle install --path vendor/bundle
+      # Store bundle cache
+
+      - save_cache:
+          key: portal-finance-api-{{ checksum "Gemfile.lock" }}
+          paths:
+            - vendor/bundle
+      - run:
+          name: Database setup
+          command: |
+                   bin/bundle exec rake db:create
+                   bin/bundle exec rake db:migrate
+                   #bin/bundle exec rake neodb:reset_password
+                   #bin/bundle exec rake neo4j:migrate
+      # Run rspec
+      - type: shell
+        command:
+          mkdir tmp/ && bundle exec rspec spec/
+      - run:
+          name: Install Docker Compose
+          command: |
+            curl -L -o /tmp/docker.tgz https://get.docker.com/builds/Linux/x86_64/docker-1.12.3.tgz
+            tar -xz -C /tmp -f /tmp/docker.tgz
+            mv /tmp/docker/docker* /usr/bin/
+
+            curl -L https://github.com/docker/compose/releases/download/1.11.2/docker-compose-`uname -s`-`uname -m` > ~/docker-compose
+            chmod +x ~/docker-compose
+            mv ~/docker-compose /usr/local/bin/docker-compose
+      - setup_remote_docker
+      - type: shell
+        name: Verify Docker Works
+        command: |
+          docker --version
+      - deploy:
+          name: Deploy Production
+          command: |
+                  if [[ "${CIRCLE_BRANCH}" == "production" ]]
+                  then
+                    export PATH=~/.local/bin:$PATH
+                    chmod 755 .circleci/deploy.sh
+                    ./.circleci/deploy.sh blue-production 1
+                  else
+                    echo "Not deployed into PRODUCTION cluster"
+                  fi
+      - deploy:
+          name: Deploy Staging
+          command: |
+                  if [[ "${CIRCLE_BRANCH}" == "staging" ]]
+                  then
+                    export PATH=~/.local/bin:$PATH
+                    chmod 755 .circleci/deploy.sh
+                    ./.circleci/deploy.sh staging 1
+                  else
+                    echo "Not deployed into STAGING cluster"
+                  fi
+      - deploy:
+          name: Deploy QA
+          command: |
+                  if [[ "${CIRCLE_BRANCH}" == "qa" ]]
+                  then
+                    export PATH=~/.local/bin:$PATH
+                    chmod 755 .circleci/deploy.sh
+                    ./.circleci/deploy.sh qa 1
+                  else
+                    echo "Not deployed to QA cluster"
+                  fi
+      - deploy:
+          name: Deploy blue production
+          command: |
+                  if [[ "${CIRCLE_BRANCH}" == "production-blue" ]]
+                  then
+                    export PATH=~/.local/bin:$PATH
+                    chmod 755 .circleci/deploy.sh
+                    ./.circleci/deploy.sh blue-production 1
+                  else
+                    echo "Not deployed into BLUE PRODUCTION cluster"
+                  fi
